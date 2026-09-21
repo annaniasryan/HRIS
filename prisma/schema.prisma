@@ -1,0 +1,233 @@
+// HRIS Prisma schema
+// Covers: user auth/roles, employees (permanent + daily workers),
+// attendance, leave management, and payroll.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+
+enum Role {
+  EXECUTIVE   // read-only high-level view across the company
+  HR_MANAGER  // full access: manage employees, approve leave, run payroll
+  HR_STAFF    // day-to-day data entry: employees, attendance, leave intake
+  WORKER      // self-service: own profile, own attendance, own leave/payslips
+}
+
+enum EmploymentType {
+  PERMANENT     // fixed monthly salary
+  DAILY_WORKER  // paid per day actually worked, no login account
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  INACTIVE
+  TERMINATED
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  HALF_DAY
+  ON_LEAVE
+  HOLIDAY
+}
+
+enum LeaveType {
+  ANNUAL
+  SICK
+  UNPAID
+  MATERNITY
+  PATERNITY
+  OTHER
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum PayrollStatus {
+  DRAFT
+  FINALIZED
+  PAID
+}
+
+// ---------- Auth ----------
+
+// System login account. Only PERMANENT staff (Executive/HR Manager/HR
+// Staff/Worker) get accounts. Daily workers are Employee records managed
+// by HR but never log in themselves.
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         Role
+  isActive     Boolean   @default(true)
+  employeeId   String?   @unique
+  employee     Employee? @relation(fields: [employeeId], references: [id])
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+// ---------- Org structure ----------
+
+model Department {
+  id        String     @id @default(cuid())
+  name      String     @unique
+  employees Employee[]
+  positions Position[]
+  createdAt DateTime   @default(now())
+}
+
+model Position {
+  id           String      @id @default(cuid())
+  title        String
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id])
+  employees    Employee[]
+  createdAt    DateTime    @default(now())
+
+  @@unique([title, departmentId])
+}
+
+// ---------- Employees ----------
+
+model Employee {
+  id             String         @id @default(cuid())
+  employeeNumber String         @unique
+  firstName      String
+  lastName       String
+  email          String?        @unique
+  phone          String?
+  address        String?
+  dateOfBirth    DateTime?
+  hireDate       DateTime
+  employmentType EmploymentType
+  status         EmployeeStatus @default(ACTIVE)
+
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id])
+  positionId   String?
+  position     Position?   @relation(fields: [positionId], references: [id])
+
+  // Compensation — exactly one of these is set depending on employmentType
+  monthlySalary Decimal? @db.Decimal(12, 2) // PERMANENT
+  dailyRate     Decimal? @db.Decimal(12, 2) // DAILY_WORKER
+
+  bankName    String?
+  bankAccount String?
+
+  user           User?
+  attendances    Attendance[]
+  leaveRequests  LeaveRequest[]
+  leaveBalances  LeaveBalance[]
+  payslips       Payslip[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([employmentType])
+}
+
+// ---------- Attendance ----------
+
+model Attendance {
+  id            String            @id @default(cuid())
+  employeeId    String
+  employee      Employee          @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date          DateTime          @db.Date
+  clockIn       DateTime?
+  clockOut      DateTime?
+  status        AttendanceStatus  @default(PRESENT)
+  hoursWorked   Decimal?          @db.Decimal(5, 2)
+  overtimeHours Decimal           @default(0) @db.Decimal(5, 2)
+  notes         String?
+  recordedById  String? // id of the User (HR staff) who recorded this entry
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@unique([employeeId, date])
+  @@index([date])
+  @@index([status])
+}
+
+// ---------- Leave ----------
+
+model LeaveRequest {
+  id           String      @id @default(cuid())
+  employeeId   String
+  employee     Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  type         LeaveType
+  startDate    DateTime    @db.Date
+  endDate      DateTime    @db.Date
+  days         Decimal     @db.Decimal(5, 2)
+  reason       String?
+  status       LeaveStatus @default(PENDING)
+  approvedById String?
+  approvedAt   DateTime?
+  rejectReason String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@index([status])
+  @@index([employeeId])
+}
+
+model LeaveBalance {
+  id         String   @id @default(cuid())
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  type       LeaveType
+  year       Int
+  allocated  Decimal  @db.Decimal(5, 2)
+  used       Decimal  @default(0) @db.Decimal(5, 2)
+
+  @@unique([employeeId, type, year])
+}
+
+// ---------- Payroll ----------
+
+model PayrollRun {
+  id          String        @id @default(cuid())
+  periodStart DateTime      @db.Date
+  periodEnd   DateTime      @db.Date
+  status      PayrollStatus @default(DRAFT)
+  payslips    Payslip[]
+  createdById String?
+  createdAt   DateTime      @default(now())
+  finalizedAt DateTime?
+
+  @@unique([periodStart, periodEnd])
+}
+
+model Payslip {
+  id             String         @id @default(cuid())
+  payrollRunId   String
+  payrollRun     PayrollRun     @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  employeeId     String
+  employee       Employee       @relation(fields: [employeeId], references: [id])
+  employmentType EmploymentType
+  daysWorked     Decimal?       @db.Decimal(5, 2) // relevant for daily workers
+  baseSalary     Decimal        @db.Decimal(12, 2)
+  overtimePay    Decimal        @default(0) @db.Decimal(12, 2)
+  allowances     Decimal        @default(0) @db.Decimal(12, 2)
+  deductions     Decimal        @default(0) @db.Decimal(12, 2)
+  grossPay       Decimal        @db.Decimal(12, 2)
+  netPay         Decimal        @db.Decimal(12, 2)
+  notes          String?
+  createdAt      DateTime       @default(now())
+
+  @@unique([payrollRunId, employeeId])
+}
